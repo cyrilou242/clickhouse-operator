@@ -1,0 +1,273 @@
+package clickhouse
+
+import (
+	_ "embed"
+	"fmt"
+	"path"
+	"strings"
+	"text/template"
+
+	v1 "github.com/clickhouse-operator/api/v1alpha1"
+	"github.com/clickhouse-operator/internal/controller"
+	keepercontroller "github.com/clickhouse-operator/internal/controller/keeper"
+	"github.com/clickhouse-operator/internal/util"
+	"gopkg.in/yaml.v2"
+)
+
+var (
+	//go:embed templates/base.yaml.tmpl
+	baseConfigTemplateStr string
+	//go:embed templates/network.yaml.tmpl
+	networkConfigTemplateStr string
+	//go:embed templates/users.yaml.tmpl
+	userConfigTemplateStr string
+
+	generators []ConfigGenerator
+)
+
+func init() {
+	for _, templateSpec := range []struct {
+		Filename  string
+		Raw       string
+		Generator configGeneratorFunc
+	}{{
+		Filename:  ConfigFileName,
+		Raw:       baseConfigTemplateStr,
+		Generator: baseConfigGenerator,
+	}, {
+		Filename:  path.Join(ConfigDPath, "00-network.yaml"),
+		Raw:       networkConfigTemplateStr,
+		Generator: networkConfigGenerator,
+	}, {
+		Filename:  UsersFileName,
+		Raw:       userConfigTemplateStr,
+		Generator: userConfigGenerator,
+	}} {
+		tmpl := template.New("").Funcs(template.FuncMap{
+			"yaml": func(v any) (string, error) {
+				data, err := yaml.Marshal(v)
+				return string(data), err
+			},
+			"indent": func(val any, v any) (string, error) {
+				builder := strings.Builder{}
+				indentation := strings.Repeat(" ", val.(int))
+				for _, line := range strings.Split(v.(string), "\n") {
+					if _, err := builder.WriteString(fmt.Sprintf("%s%s\n", indentation, line)); err != nil {
+						return "", fmt.Errorf("failed to write indented line: %w", err)
+					}
+				}
+
+				return builder.String(), nil
+			},
+		})
+		if _, err := tmpl.Parse(templateSpec.Raw); err != nil {
+			panic(fmt.Sprintf("failed to parse template %s: %v", templateSpec.Filename, err))
+		}
+
+		generators = append(generators, &templateConfigGenerator{
+			File:      templateSpec.Filename,
+			template:  tmpl,
+			generator: templateSpec.Generator,
+		})
+	}
+
+	generators = append(generators, &extraConfigGenerator{})
+}
+
+type ConfigGenerator interface {
+	Filename() string
+	Exists(ctx *reconcileContext) bool
+	Generate(ctx *reconcileContext, id v1.ReplicaID) (string, error)
+}
+
+type templateConfigGenerator struct {
+	File      string
+	template  *template.Template
+	generator configGeneratorFunc
+}
+
+func (g *templateConfigGenerator) Filename() string {
+	return g.File
+}
+
+func (g *templateConfigGenerator) Exists(*reconcileContext) bool {
+	return true
+}
+
+func (g *templateConfigGenerator) Generate(ctx *reconcileContext, id v1.ReplicaID) (string, error) {
+	data, err := g.generator(g.template, ctx, id)
+	if err != nil {
+		return "", fmt.Errorf("generate config %s: %w", g.File, err)
+	}
+
+	return data, nil
+}
+
+type configGeneratorFunc func(tmpl *template.Template, ctx *reconcileContext, id v1.ReplicaID) (string, error)
+
+type baseConfigParams struct {
+	Path   string
+	Log    controller.LoggerConfig
+	Macros map[string]any
+
+	KeeperNodes               []keeperNode
+	KeeperIdentityEnv         string
+	ClusterDiscoveryPath      string
+	ShardID                   int32
+	DistributedDDLPath        string
+	DistributedDDLProfileName string
+	UsersXMLPath              string
+	UsersZookeeperPath        string
+	UDFZookeeperPath          string
+
+	OpenSSL controller.OpenSSLConfig
+}
+
+type keeperNode struct {
+	Host   string
+	Port   int32
+	Secure bool
+}
+
+func baseConfigGenerator(tmpl *template.Template, ctx *reconcileContext, id v1.ReplicaID) (string, error) {
+	keeperNodes := make([]keeperNode, 0, ctx.keeper.Replicas())
+	for _, host := range ctx.keeper.Hostnames() {
+		if ctx.keeper.Spec.Settings.TLS.Enabled {
+			keeperNodes = append(keeperNodes, keeperNode{
+				Host:   host,
+				Port:   keepercontroller.PortNativeSecure,
+				Secure: true,
+			})
+		} else {
+			keeperNodes = append(keeperNodes, keeperNode{
+				Host: host,
+				Port: keepercontroller.PortNative,
+			})
+		}
+	}
+
+	openSSL := controller.OpenSSLConfig{}
+	if ctx.Cluster.Spec.Settings.TLS.Enabled {
+		params := controller.OpenSSLParams{
+			CertificateFile:     path.Join(TLSConfigPath, CertificateFilename),
+			PrivateKeyFile:      path.Join(TLSConfigPath, KeyFilename),
+			CAConfig:            path.Join(TLSConfigPath, CABundleFilename),
+			VerificationMode:    "relaxed",
+			DisableProtocols:    "sslv2,sslv3",
+			PreferServerCiphers: true,
+		}
+
+		openSSL = controller.OpenSSLConfig{
+			Server: params,
+			Client: params,
+		}
+	}
+
+	if ctx.Cluster.Spec.Settings.TLS.CABundle != nil {
+		openSSL.Client.CAConfig = path.Join(TLSConfigPath, CustomCAFilename)
+		openSSL.Client.VerificationMode = "relaxed"
+		openSSL.Client.DisableProtocols = "sslv2,sslv3"
+		openSSL.Client.PreferServerCiphers = true
+	}
+
+	params := baseConfigParams{
+		Path: BaseDataPath,
+		Log:  controller.GenerateLoggerConfig(ctx.Cluster.Spec.Settings.Logger, LogPath, "clickhouse-server"),
+		Macros: map[string]any{
+			"cluster": DefaultClusterName,
+			"shard":   id.ShardID,
+			"replica": id.Index,
+		},
+
+		KeeperNodes:               keeperNodes,
+		KeeperIdentityEnv:         EnvKeeperIdentity,
+		ClusterDiscoveryPath:      KeeperPathDiscovery,
+		ShardID:                   id.ShardID,
+		DistributedDDLPath:        KeeperPathDistributedDDL,
+		DistributedDDLProfileName: DefaultProfileName,
+		UsersXMLPath:              UsersFileName,
+		UsersZookeeperPath:        KeeperPathUsers,
+		UDFZookeeperPath:          KeeperPathUDF,
+
+		OpenSSL: openSSL,
+	}
+
+	builder := strings.Builder{}
+	if err := tmpl.Execute(&builder, params); err != nil {
+		return "", err
+	}
+
+	return builder.String(), nil
+}
+
+type networkConfigParams struct {
+	InterserverHTTPPort           uint16
+	InterserverHTTPUser           string
+	InterserverHTTPPasswordEnvVar string
+	Protocols                     map[string]Protocol
+}
+
+func networkConfigGenerator(tmpl *template.Template, ctx *reconcileContext, _ v1.ReplicaID) (string, error) {
+	protocols := buildProtocols(ctx.Cluster)
+	delete(protocols, "interserver")
+
+	params := networkConfigParams{
+		InterserverHTTPPort:           PortInterserver,
+		InterserverHTTPUser:           InterserverUserName,
+		InterserverHTTPPasswordEnvVar: EnvInterserverPassword,
+		Protocols:                     protocols,
+	}
+
+	builder := strings.Builder{}
+	if err := tmpl.Execute(&builder, params); err != nil {
+		return "", err
+	}
+
+	return builder.String(), nil
+}
+
+type userConfigParams struct {
+	DefaultUserPasswordEnv   string
+	DefaultProfileName       string
+	OperatorUserName         string
+	OperatorUserPasswordHash string
+}
+
+func userConfigGenerator(tmpl *template.Template, ctx *reconcileContext, _ v1.ReplicaID) (string, error) {
+	passEnv := EnvDefaultUserPassword
+	if ctx.Cluster.Spec.Settings.DefaultUserPassword == nil {
+		passEnv = ""
+	}
+
+	params := userConfigParams{
+		DefaultUserPasswordEnv:   passEnv,
+		DefaultProfileName:       DefaultProfileName,
+		OperatorUserName:         OperatorManagementUsername,
+		OperatorUserPasswordHash: util.Sha256Hash(ctx.secret.Data[SecretKeyManagementPassword]),
+	}
+
+	builder := strings.Builder{}
+	if err := tmpl.Execute(&builder, params); err != nil {
+		return "", err
+	}
+
+	return builder.String(), nil
+}
+
+type extraConfigGenerator struct{}
+
+func (g *extraConfigGenerator) Filename() string {
+	return path.Join(ConfigDPath, ExtraConfigFileName)
+}
+
+func (g *extraConfigGenerator) Exists(ctx *reconcileContext) bool {
+	return len(ctx.Cluster.Spec.Settings.ExtraConfig.Raw) > 0
+}
+
+func (g *extraConfigGenerator) Generate(ctx *reconcileContext, id v1.ReplicaID) (string, error) {
+	if !g.Exists(ctx) {
+		return "", fmt.Errorf("extra config generator called, but no extra config provided")
+	}
+
+	return string(ctx.Cluster.Spec.Settings.ExtraConfig.Raw), nil
+}
