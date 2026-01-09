@@ -1,10 +1,16 @@
-# ClickHouse-Operator
 
-## Description
+
+[![Website](https://img.shields.io/website?up_message=AVAILABLE&down_message=DOWN&url=https%3A%2F%2Fclickhouse.com&style=for-the-badge)](https://clickhouse.com)
+[![Apache 2.0 License](https://img.shields.io/badge/license-Apache%202.0-blueviolet?style=for-the-badge)](https://www.apache.org/licenses/LICENSE-2.0)
+
+<img align="left" width="200" style="margin-right: 20px;" src="https://github.com/user-attachments/assets/e3dfd12f-9d66-4f11-aac8-2a7d5bb7a507" alt="The ClickHouse Operator logo.">
+
+### ClickHouse Operator
 
 The ClickHouse Operator is a Kubernetes operator that automates the deployment, configuration, and management of ClickHouse clusters and ClickHouse Keeper clusters on Kubernetes.
 It provides declarative cluster management through custom resources, enabling users to easily create highly-available ClickHouse deployments.
-The operator handles the full lifecycle of ClickHouse clusters including scaling, upgrades, and configuration management.
+
+The Operator handles the full lifecycle of ClickHouse clusters including scaling, upgrades, and configuration management.
 
 ## Features
 
